@@ -11,6 +11,7 @@ celery_redis_prometheus changes
 - Make which queues to look at lengths for configurable.
 - Make histogram buckets configurable, and change default to be longer durations.
 - Add histogram for prefetch latency
+- Add gauge for nubmer of workers responding to ping
 - Fix: Calculate queue time based on time between task sent and time started, rather than local time started.
   There could be clock differences between local time started and the actual time started.
 

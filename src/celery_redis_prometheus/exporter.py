@@ -57,7 +57,9 @@ STATS = {
     'prefetch_latency': prometheus_client.Histogram(
         'celery_task_prefetch_latency_seconds', 'Time spent between prefetching and starting the task', labelnames=['queue', 'name'], buckets=PREFETCH_LATENCY_BUCKETS),
     'queues': prometheus_client.Gauge(
-        'celery_queue_length', 'Queue length', ['queue'])
+        'celery_queue_length', 'Queue length', ['queue']),
+    'workers': prometheus_client.Gauge(
+        'celery_workers', 'Number of workers responding to ping')
 }
 
 
@@ -81,6 +83,7 @@ def prometheus(broker, port, host, debug, queuelength_interval, queuelength_queu
 
 class PrometheusExporterCommand:
     queuelength_thread = None
+    worker_thread = None
 
     def __init__(self, app):
         self.app = app
@@ -98,6 +101,8 @@ class PrometheusExporterCommand:
                 log.info('Exiting')
                 if self.queuelength_thread:
                     self.queuelength_thread.stop()
+                if self.worker_thread:
+                    self.worker_thread.stop()
                 _thread.interrupt_main()
                 break
             except Exception as e:
@@ -119,6 +124,8 @@ class PrometheusExporterCommand:
             self.queuelength_thread = QueueLengthMonitor(
                 self.app, queuelength_interval,  queuelength_queues)
             self.queuelength_thread.start()
+        self.worker_thread = WorkerMonitor(self.app, interval=5, timeout=5)
+        self.worker_thread.start()
 
 
 def task_handler(fn):
@@ -220,6 +227,30 @@ class QueueLengthMonitor(threading.Thread):
                 for queue, length in lengths.items():
                     STATS['queues'].labels(queue).set(length)
 
+                time.sleep(self.interval)
+            except Exception:
+                log.error(
+                    'Uncaught exception, preventing thread from crashing.',
+                    exc_info=True)
+
+    def stop(self):
+        self.running = False
+
+
+class WorkerMonitor(threading.Thread):
+
+    def __init__(self, app, *, interval, timeout):
+        super(WorkerMonitor, self).__init__()
+        self.app = app
+        self.interval = interval
+        self.timeout = timeout
+        self.running = True
+
+    def run(self):
+        log.info(f'Monitoring workers')
+        while self.running:
+            try:
+                STATS['workers'].set(len(self.app.control.ping(timeout=self.timeout)))
                 time.sleep(self.interval)
             except Exception:
                 log.error(

@@ -38,6 +38,7 @@ We export the following metrics:
 * ``celery_task_queue_time_seconds``, histogram (only if ``task_send_sent_event`` is enabled in Celery)
 * ``celery_task_runtime_seconds``, histogram
 * ``celery_task_prefetch_latency_seconds``, histogram
+* ``celery_workers``, gauge
 
 If you pass ``--queuelength-interval=x`` then every x seconds the queue lengths will be checked (NOTE: this only works with redis as the broker), resulting in this additional metric:
 
