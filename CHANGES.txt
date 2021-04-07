@@ -1,6 +1,19 @@
 celery_redis_prometheus changes
 ===============================
 
+
+2.0.0 (unreleased)
+------------------
+
+- Support celery 5
+- Support Python 3 only
+- Add labels for queue name / task name.
+- Make which queues to look at lengths for configurable.
+- Make histogram buckets configurable, and change default to be longer durations.
+- Add histogram for prefetch latency
+- Fix: Calculate queue time based on time between task sent and time started, rather than local time started.
+  There could be clock differences between local time started and the actual time started.
+
 1.2.0 (unreleased)
 ------------------
 

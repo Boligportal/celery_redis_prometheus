@@ -1,16 +1,26 @@
-from functools import wraps
-import celery.bin.base
+# Usage:  celery prometheus --help
+
 import collections
-import json
 import logging
-import prometheus_client
+import os
+import sys
 import threading
 import time
+from functools import wraps
+from typing import Sequence
+
+import click
+import prometheus_client
+from celery import Celery
+from prometheus_client.utils import INF
 
 try:
     import _thread
 except ImportError:  # py2
     import thread as _thread
+
+# Log to stdout
+logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
 
 log = logging.getLogger(__name__)
@@ -21,24 +31,61 @@ log = logging.getLogger(__name__)
 for collector in list(prometheus_client.REGISTRY._collector_to_names):
     prometheus_client.REGISTRY.unregister(collector)
 
+DEFAULT_BUCKETS = (0.1, 0.5, 1, 2, 5, 10, 30, 60, 60 * 2, 60 * 5, 60 * 10, 60 * 30, INF)
+
+
+def get_buckets_setting(name: str, default: Sequence[float]) -> Sequence[float]:
+    buckets_str = os.getenv(name, None)
+    if buckets_str:
+        return tuple(float(bucket) for bucket in buckets_str.split(","))
+    else:
+        return default
+
+
+QUEUE_TIME_BUCKETS = get_buckets_setting("QUEUE_TIME_BUCKETS", DEFAULT_BUCKETS)
+RUNTIME_BUCKETS = get_buckets_setting("RUNTIME_BUCKETS", DEFAULT_BUCKETS)
+PREFETCH_LATENCY_BUCKETS = get_buckets_setting("PREFETCH_LATENCY_BUCKETS", DEFAULT_BUCKETS)
+
 
 STATS = {
     'tasks': prometheus_client.Counter(
-        'celery_tasks_total', 'Number of tasks', ['state']),
-    'queuetime': prometheus_client.Histogram(
-        'celery_task_queuetime_seconds', 'Task queue wait time'),
+        'celery_tasks_total', 'Number of tasks', ['state', 'queue', 'name']),
+    'queue_time': prometheus_client.Histogram(
+        'celery_task_queue_time_seconds', 'Time between enqueuing the task and starting the task', labelnames=['queue', 'name'], buckets=QUEUE_TIME_BUCKETS),
     'runtime': prometheus_client.Histogram(
-        'celery_task_runtime_seconds', 'Task runtime'),
+        'celery_task_runtime_seconds', 'Task runtime', labelnames=['queue', 'name'], buckets=RUNTIME_BUCKETS),
+    'prefetch_latency': prometheus_client.Histogram(
+        'celery_task_prefetch_latency_seconds', 'Time spent between prefetching and starting the task', labelnames=['queue', 'name'], buckets=PREFETCH_LATENCY_BUCKETS),
     'queues': prometheus_client.Gauge(
         'celery_queue_length', 'Queue length', ['queue'])
 }
 
 
-class Command(celery.bin.base.Command):
+@click.command()
+@click.option('--port', default=9691, type=int, help='Server port')
+@click.option('--host', default='', help='Server host')
+@click.option('--broker', default='', help='Broker URL')
+@click.option('--debug', is_flag=True)
+@click.option('--queuelength-interval', '-i',
+    help='Check queue lengths every x seconds (0=disabled)',
+    type=int, default=0)
+@click.option('--queuelength-queues', '-q',
+    help='Names of queues to monitor length of',
+    multiple=True, default=['celery'])
+def prometheus(broker, port, host, debug, queuelength_interval, queuelength_queues):
+    app = Celery(broker=broker)
+    cmd = PrometheusExporterCommand(app=app)
+    cmd.prepare_args(port=port, host=host, debug=debug, queuelength_interval=queuelength_interval,  queuelength_queues=queuelength_queues)
+    cmd.run()
 
+
+class PrometheusExporterCommand:
     queuelength_thread = None
 
-    def run(self, **kw):
+    def __init__(self, app):
+        self.app = app
+
+    def run(self):
         receiver = CeleryEventReceiver(self.app)
 
         try_interval = 1
@@ -60,35 +107,18 @@ class Command(celery.bin.base.Command):
                     e, try_interval, exc_info=True)
                 time.sleep(try_interval)
 
-    def prepare_args(self, *args, **kw):
-        options, args = super(Command, self).prepare_args(*args, **kw)
+    def prepare_args(self, *, port, host, debug, queuelength_interval,  queuelength_queues):
         self.app.log.setup(
-            logging.DEBUG if options.get('verbose') else logging.INFO)
+            logging.DEBUG if debug else logging.INFO)
 
         log.info('Listening on %s:%s',
-                 options['host'] or '0.0.0.0', options['port'])
-        prometheus_client.start_http_server(options['port'], options['host'])
+                 host or '0.0.0.0', port)
+        prometheus_client.start_http_server(port, host)
 
-        if options['queuelength_interval']:
+        if queuelength_interval:
             self.queuelength_thread = QueueLengthMonitor(
-                self.app, options['queuelength_interval'])
+                self.app, queuelength_interval,  queuelength_queues)
             self.queuelength_thread.start()
-
-        return options, args
-
-    def add_arguments(self, parser):
-        parser.add_argument(
-            '--verbose', help='Enable debug logging', action='store_true')
-
-        parser.add_argument(
-            '--host', default='', help='Listen host')
-        parser.add_argument(
-            '--port', default=9691, type=int, help='Listen port')
-
-        parser.add_argument(
-            '--queuelength-interval',
-            help='Check queue lengths every x seconds (0=disabled)',
-            type=int, default=0)
 
 
 def task_handler(fn):
@@ -111,31 +141,38 @@ class CeleryEventReceiver(object):
         # task.routing_key is always None, even though in redis it contains the
         # queue name.
         log.debug('Started %s', task)
-        STATS['tasks'].labels('started').inc()
+        STATS['tasks'].labels(state='started', queue=task.routing_key, name=task.name).inc()
         if task.sent:
-            STATS['queuetime'].observe(time.time() - task.sent)
+            STATS['queue_time'].labels(queue=task.routing_key, name=task.name).observe(task.started - task.sent)
+        if task.received:
+            STATS['prefetch_latency'].labels(queue=task.routing_key, name=task.name).observe(task.started - task.received)
 
     @task_handler
     def on_task_succeeded(self, event, task):
         log.debug('Succeeded %s', task)
-        STATS['tasks'].labels('succeeded').inc()
+        STATS['tasks'].labels(state='succeeded', queue=task.routing_key, name=task.name).inc()
         self.record_runtime(task)
 
     def record_runtime(self, task):
         if task is not None and task.runtime is not None:
-            STATS['runtime'].observe(task.runtime)
+            STATS['runtime'].labels(queue=task.routing_key, name=task.name).observe(task.runtime)
 
     @task_handler
     def on_task_failed(self, event, task):
         log.debug('Failed %s', task)
-        STATS['tasks'].labels('failed').inc()
+        STATS['tasks'].labels(state='failed', queue=task.routing_key, name=task.name).inc()
         self.record_runtime(task)
 
     @task_handler
     def on_task_retried(self, event, task):
         log.debug('Retried %s', task)
-        STATS['tasks'].labels('retried').inc()
+        STATS['tasks'].labels(state='retried', queue=task.routing_key, name=task.name).inc()
         self.record_runtime(task)
+
+    @task_handler
+    def on_task_revoked(self, event, task):
+        log.debug('Revoked %s', task)
+        STATS['tasks'].labels(state='revoked', queue=task.routing_key, name=task.name).inc()
 
     def __call__(self, *args, **kw):
         self.state = self.app.events.State()
@@ -147,6 +184,7 @@ class CeleryEventReceiver(object):
                 'task-succeeded': self.on_task_succeeded,
                 'task-failed': self.on_task_failed,
                 'task-retried': self.on_task_retried,
+                'task-revoked': self.on_task_revoked,
                 '*': self.state.event,
             })
             recv.capture(*args, **kw)
@@ -154,13 +192,15 @@ class CeleryEventReceiver(object):
 
 class QueueLengthMonitor(threading.Thread):
 
-    def __init__(self, app, interval):
+    def __init__(self, app, interval, queues):
         super(QueueLengthMonitor, self).__init__()
         self.app = app
+        self.queues = queues
         self.interval = interval
         self.running = True
 
     def run(self):
+        log.info(f'Monitoring queue length for queues: {", ".join(self.queues)}')
         while self.running:
             try:
                 lengths = collections.Counter()
@@ -168,22 +208,14 @@ class QueueLengthMonitor(threading.Thread):
                 with self.app.connection() as connection:
                     pipe = connection.channel().client.pipeline(
                         transaction=False)
-                    for queue in self.app.conf['task_queues']:
+                    for queue in self.queues:
                         # Not claimed by any worker yet
-                        pipe.llen(queue.name)
-                    # Claimed by worker but not acked/processed yet
-                    pipe.hvals('unacked')
+                        pipe.llen(queue)
 
                     result = pipe.execute()
 
-                unacked = result.pop()
-                for task in unacked:
-                    data = json.loads(task.decode('utf-8'))
-                    queue = data[-1]
-                    lengths[queue] += 1
-
-                for llen, queue in zip(result, self.app.conf['task_queues']):
-                    lengths[queue.name] += llen
+                for llen, queue in zip(result, self.queues):
+                    lengths[queue] += llen
 
                 for queue, length in lengths.items():
                     STATS['queues'].labels(queue).set(length)
